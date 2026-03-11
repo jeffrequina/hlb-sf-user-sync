@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+local.settings.json
+*.js.map
+.DS_Store
+.funcignore
+bin/
+obj/
+
+*.log
