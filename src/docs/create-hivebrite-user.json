@@ -1,0 +1,57 @@
+{
+  "id": 0,
+  "email": "string",
+  "name": "string",
+  "firstname": "string",
+  "lastname": "string",
+  "maidenname": "string",
+  "is_active": true,
+  "gender": "male",
+  "birthday": "2026-03-11",
+  "birthplace": "string",
+  "headline": "string",
+  "summary": "string",
+  "mobile_perso": "string",
+  "mobile_pro": "string",
+  "landline_perso": "string",
+  "landline_pro": "string",
+  "postal_personal": {
+    "id": 0,
+    "address_1": "string",
+    "address_2": "string",
+    "address_3": "string",
+    "city": "string",
+    "state": "string",
+    "full_name": "string",
+    "postal_code": "string",
+    "country": "AD"
+  },
+  "postal_work": {
+    "id": 0,
+    "address_1": "string",
+    "address_2": "string",
+    "address_3": "string",
+    "city": "string",
+    "state": "string",
+    "full_name": "string",
+    "postal_code": "string",
+    "country": "AD"
+  },
+  "role_id": 0,
+  "awards": "string",
+  "linkedin_profile_url": "string",
+  "website": "string",
+  "twitter": "string",
+  "timezone": "Africa/Abidjan",
+  "facebook_profile_url": "string",
+  "instagram_profile_url": "string",
+  "honorary_title": "mr",
+  "resume": "string",
+  "locale": "en",
+  "skills": [
+    {
+      "id": 0,
+      "name": "string"
+    }
+  ]
+}

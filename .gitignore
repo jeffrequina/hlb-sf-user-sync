@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .env
+.vscode/
+.azurite/
 local.settings.json
 *.js.map
 .DS_Store

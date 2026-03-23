@@ -1,0 +1,5 @@
+https://d20000000ch6meac.my.salesforce.com/services/data/v60.0/query?q=SELECT+
+  Id,
+  ...fields from salesforce-contacts-final-fields.json,
+  Email
++FROM+Contact+WHERE+Email='<HIVEBRITE_USER_EMAIL_HERE>'

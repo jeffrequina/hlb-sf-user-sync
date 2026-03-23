@@ -5,13 +5,11 @@ import {
   InvocationContext,
 } from "@azure/functions";
 import { SalesforceWebhookPayloadSchema } from "../models/salesforce-user.model";
-import { HivebriteService } from "../services/hivebrite.service";
+import { hivebriteService } from "../services/hivebrite.service";
 import { mapSalesforceUserToHivebrite } from "../services/user-mapper.service";
 import { validateSalesforceSignature } from "../middleware/auth.middleware";
 import { normaliseError } from "../utils/errors";
 import logger from "../utils/logger";
-
-const hivebriteService = new HivebriteService();
 
 /**
  * HTTP Trigger: syncSalesforceUser
@@ -162,8 +160,6 @@ async function healthCheckHandler(
   });
 }
 
-// ── Helper ──────────────────────────────────────────────────────────────────
-
 function jsonResponse(status: number, body: unknown): HttpResponseInit {
   return {
     status,
@@ -171,8 +167,6 @@ function jsonResponse(status: number, body: unknown): HttpResponseInit {
     body: JSON.stringify(body),
   };
 }
-
-// ── Register Azure Functions ────────────────────────────────────────────────
 
 app.http("syncSalesforceUser", {
   methods: ["POST"],
