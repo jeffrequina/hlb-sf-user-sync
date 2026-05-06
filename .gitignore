@@ -9,5 +9,6 @@ local.settings.json
 .funcignore
 bin/
 obj/
-
+config/
+docs/
 *.log
