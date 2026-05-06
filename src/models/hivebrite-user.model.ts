@@ -66,7 +66,6 @@ export const HivebriteCreateUserSchema = z.object({
   instagram_profile_url: z.string().optional(),
   honorary_title: z.enum(["mr", "mrs", "ms", "dr", "prof"]).optional(),
   resume: z.string().optional(),
-  locale: z.string().optional().default("en"),
   skills: z.array(SkillSchema).optional(),
 
   // External / SSO identifier — available on both create and update
@@ -74,6 +73,10 @@ export const HivebriteCreateUserSchema = z.object({
 
   // Custom profile attributes (multi-value fields like groups, industries, etc.)
   custom_attributes: z.array(CustomAttributeSchema).optional(),
+
+  // Sub-network membership IDs. Must include at least one entry on create;
+  // use [0] to assign to the default/root sub-network.
+  sub_network_ids: z.array(z.number()).optional(),
 });
 
 export type HivebriteCreateUser = z.infer<typeof HivebriteCreateUserSchema>;
@@ -84,6 +87,10 @@ export type HivebriteCreateUser = z.infer<typeof HivebriteCreateUserSchema>;
 // Update extends create and adds additional fields only available on update.
 
 export const HivebriteUpdateUserSchema = HivebriteCreateUserSchema.extend({
+  // id and email are not required for updates — user is identified by ID in the URL
+  id: z.number().optional(),
+  email: z.string().email().optional(),
+
   // Name prefix / suffix
   prefix_firstname: z.string().optional(),
   prefix_name: z.string().optional(),
@@ -99,17 +106,6 @@ export const HivebriteUpdateUserSchema = HivebriteCreateUserSchema.extend({
 
   skype: z.string().optional(),
   bbm: z.string().optional(),
-
-  live_location: z
-    .object({
-      address: z.string().optional(),
-      lat: z.number().optional(),
-      lng: z.number().optional(),
-      city: z.string().optional(),
-      country: z.string().optional(),
-      country_code: z.string().optional(),
-    })
-    .optional(),
 });
 
 export type HivebriteUpdateUser = z.infer<typeof HivebriteUpdateUserSchema>;

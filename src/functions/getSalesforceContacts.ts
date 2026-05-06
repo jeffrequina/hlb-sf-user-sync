@@ -4,6 +4,7 @@ import { hivebriteService } from "../services/hivebrite.service";
 import { SalesforceContactRecord } from "../models/salesforce-query.model";
 import {
   HivebriteCreateUser,
+  HivebriteUpdateUser,
   HivebriteCustomAttribute,
   HivebriteUserResponse,
 } from "../models/hivebrite-user.model";
@@ -30,13 +31,17 @@ const POLL_SCHEDULE = "0 */15 * * * *";
  *
  * Default: 15 minutes (matches the production poll interval).
  */
-const REVERSE_SYNC_WINDOW_MS = 15 * 60 * 1000;
+// const REVERSE_SYNC_WINDOW_MS = 15 * 60 * 1000;
+const REVERSE_SYNC_WINDOW_MS = 20 * 60 * 1000;
 
 // ── Shared custom-attribute name constants ────────────────────────────────────
 
 const ATTR_SKILL = "_0a86d02f_Skill";
 const ATTR_INDUSTRIES = "_a3d06190_Industries";
 const ATTR_LANGUAGE = "_ced3eaa1_Language";
+
+/** Default Hivebrite sub-network to assign on user creation. */
+// const DEFAULT_SUB_NETWORK_IDS = [129071];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -73,11 +78,16 @@ function getAttrValues(
 // ── Phase 1: Salesforce → Hivebrite mapper ────────────────────────────────────
 
 /**
- * Map a Salesforce Contact record to a Hivebrite create/update payload.
+ * Build the shared Hivebrite fields from a Salesforce Contact.
+ *
+ * Email is intentionally excluded here:
+ *   - Creates: email is added at the call site (required by Hivebrite)
+ *   - Updates: email must NOT be sent — Hivebrite rejects it with
+ *     "Email has already been taken" even when the value is unchanged.
  *
  *   SF LastName              → HB lastname
  *   SF FirstName             → HB firstname
- *   SF Email                 → HB email + sso_identifier
+ *   SF Email                 → HB sso_identifier (only — not email field)
  *   SF Description           → HB summary
  *   SF LinkedInUrl__c        → HB linkedin_profile_url
  *   SF Contact_Groups__c  \
@@ -85,9 +95,9 @@ function getAttrValues(
  *   SF Contact_Industries__c → HB custom_attributes[_a3d06190_Industries]
  *   SF Contact_Languages__c  → HB custom_attributes[_ced3eaa1_Language]
  */
-function mapContactToHivebrite(
+export function mapContactToHivebrite(
   contact: SalesforceContactRecord
-): HivebriteCreateUser {
+): HivebriteUpdateUser {
   const skillValues = [
     ...parseCommaList(contact.Contact_Groups__c),
     ...parseCommaList(contact.Contact_Skills__c),
@@ -110,16 +120,13 @@ function mapContactToHivebrite(
   }
 
   return {
-    id: 0,
-    email: contact.Email!,
-    firstname: contact.FirstName ?? "",
     lastname: contact.LastName,
+    firstname: contact.FirstName ?? "",
     is_active: true,
+    sso_identifier: contact.Email!,
     summary: contact.Description ?? undefined,
     linkedin_profile_url: contact.LinkedInUrl__c ?? undefined,
-    sso_identifier: contact.Email!,
     ...(customAttributes.length > 0 ? { custom_attributes: customAttributes } : {}),
-    locale: "en",
   };
 }
 
@@ -157,20 +164,33 @@ function mapHivebriteToSalesforceContact(
   if (industriesStr)    payload.Contact_Industries__c = industriesStr;
   if (languagesStr)     payload.Contact_Languages__c  = languagesStr;
 
+  // TEMP TESTING: log the payload
+  // logger.info("_______Hivebrite TO SALESFORCE PAYLOAD", {
+  //   payload: JSON.stringify(payload),
+  // });
+
   return payload;
 }
 
 // ── Phase 1 ───────────────────────────────────────────────────────────────────
 
 /**
- * Sync all Salesforce contacts → Hivebrite (create or update).
+ * Sync recently-modified Salesforce contacts → Hivebrite (create or update).
+ *
+ * Only contacts whose `LastModifiedDate >= updatedSince` are fetched, so the
+ * number of Hivebrite API calls per run scales with recent changes rather than
+ * the entire 12 k+ contact corpus.
+ *
+ * @param updatedSince - ISO 8601 string shared with the Phase 2 window
  */
 async function syncSalesforceToHivebrite(
-  runLogger: ReturnType<typeof logger.child>
+  runLogger: ReturnType<typeof logger.child>,
+  updatedSince: string
 ): Promise<void> {
-  runLogger.info("Phase 1 start: Salesforce → Hivebrite");
+  runLogger.info("Phase 1 start: Salesforce → Hivebrite", { updatedSince });
 
-  const { records, totalSize } = await salesforceContactsService.getContacts();
+  const { records, totalSize } =
+    await salesforceContactsService.getRecentlyModifiedContacts(updatedSince);
 
   runLogger.info("Salesforce contacts retrieved", { totalSize });
 
@@ -196,33 +216,58 @@ async function syncSalesforceToHivebrite(
     }
 
     // TEMP TESTING: only sync ssmith@eidebailly.com
-    if (contact.Email !== "ssmith@eidebailly.com") {
-      runLogger.warn("Phase 1: skipping contact — NOT ssmith@eidebailly.com (TEMP TESTING)", {
-        salesforceId: contact.Id,
-        name: contact.Name,
-        email: contact.Email,
-      });
-      skipped++;
-      continue;
-    }
+    // if (contact.Email !== "ssmith@eidebailly.com") {
+    //   // runLogger.warn("Phase 1: skipping contact — NOT ssmith@eidebailly.com (TEMP TESTING)", {
+    //   //   salesforceId: contact.Id,
+    //   //   name: contact.Name,
+    //   //   email: contact.Email,
+    //   // });
+    //   skipped++;
+    //   continue;
+    // }
+
+    // if (contact.Email === "ssmith@eidebailly.com") {
+    //   runLogger.warn("Phase 1: contact — IS EQUAL TO ssmith@eidebailly.com (TEMP TESTING)", {
+    //     salesforceId: contact.Id,
+    //     name: contact.Name,
+    //     email: contact.Email,
+    //   });
+    // }
 
     const cLog = runLogger.child({ salesforceId: contact.Id, email: contact.Email });
 
     try {
-      // console.log("______contact.Email", contact.Email);
       const existingUser = await hivebriteService.findUserByEmailPost(contact.Email);
       const payload = mapContactToHivebrite(contact);
 
+      // logger.info("_______SF TO HB PAYLOAD", {
+      //   existingUser: JSON.stringify(existingUser),
+      //   payload: JSON.stringify(payload),
+      // });
+
       if (existingUser) {
-        // console.log("______existingUser UPDATED");
+        // Update: email is excluded from payload (Hivebrite rejects it as "already taken")
         await hivebriteService.updateUser(existingUser.id, payload);
         cLog.info("Phase 1: Hivebrite user updated", { hivebriteId: existingUser.id });
         updated++;
-      } else {
-        // console.log("______User CREATED");
-        const newUser = await hivebriteService.createUser(payload);
-        cLog.info("Phase 1: Hivebrite user created", { hivebriteId: newUser.id });
-        created++;
+      } 
+      else if (existingUser === undefined) {
+        cLog.info("Phase 1: Hivebrite user is recently updated... skipping");
+        skipped++;
+        continue;
+      }
+      else {
+        // Create: email is required — add it back here
+        // const newUser = await hivebriteService.createUser({
+        //   ...payload,
+        //   email: contact.Email!,
+        //   sub_network_ids: DEFAULT_SUB_NETWORK_IDS,
+        // } as HivebriteCreateUser);
+        // cLog.info("Phase 1: Hivebrite user created", { hivebriteId: newUser.id });
+        // created++;
+
+        // Create new user is now handled by the createHivebriteUsers timer
+        continue;
       }
     } catch (err: unknown) {
       cLog.error("Phase 1: failed to sync contact to Hivebrite", {
@@ -231,7 +276,7 @@ async function syncSalesforceToHivebrite(
     }
   }
 
-  runLogger.info("Phase 1 complete: Salesforce → Hivebrite", {
+  runLogger.info("", {
     total: totalSize,
     created,
     updated,
@@ -247,12 +292,13 @@ async function syncSalesforceToHivebrite(
  *
  * Moving window: [now - REVERSE_SYNC_WINDOW_MS, now].
  * Only contacts that already exist in Salesforce are updated — no creates.
+ *
+ * @param updatedSince - ISO 8601 string shared with the Phase 1 window
  */
 async function syncHivebriteToSalesforce(
-  runLogger: ReturnType<typeof logger.child>
+  runLogger: ReturnType<typeof logger.child>,
+  updatedSince: string
 ): Promise<void> {
-  const updatedSince = new Date(Date.now() - REVERSE_SYNC_WINDOW_MS).toISOString();
-
   runLogger.info("Phase 2 start: Hivebrite → Salesforce", { updatedSince });
 
   const recentUsers = await hivebriteService.getRecentlyUpdatedUsers(updatedSince);
@@ -280,18 +326,31 @@ async function syncHivebriteToSalesforce(
     }
 
     // TEMP TESTING: only sync ssmith@eidebailly.com
-    if (hbUser.email !== "ssmith@eidebailly.com") {
-      runLogger.warn("Phase 2: skipping Hivebrite user — NOT ssmith@eidebailly.com (TEMP TESTING)", {
-        hivebriteId: hbUser.id,
-        email: hbUser.email,
-      });
-      skipped++;
-      continue;
-    }
+    // if (hbUser.email !== "ssmith@eidebailly.com") {
+    //   // runLogger.warn("Phase 2: skipping Hivebrite user — NOT ssmith@eidebailly.com (TEMP TESTING)", {
+    //   //   hivebriteId: hbUser.id,
+    //   //   email: hbUser.email,
+    //   // });
+    //   skipped++;
+    //   continue;
+    // }
 
     const uLog = runLogger.child({ hivebriteId: hbUser.id, email: hbUser.email });
 
     try {
+      // Fetch the full Hivebrite user profile — the list endpoint used by
+      // getRecentlyUpdatedUsers only returns summary fields. Fields such as
+      // summary, linkedin_profile_url, and custom_attributes are only present
+      // on GET /users/{id}.
+      const fullHbUser = await hivebriteService.getUserById(hbUser.id);
+      if (!fullHbUser) {
+        uLog.warn("Phase 2: could not fetch full Hivebrite user — skipping", {
+          hivebriteId: hbUser.id,
+        });
+        skipped++;
+        continue;
+      }
+
       // Find the matching Salesforce contact by email
       const sfContact = await salesforceContactsService.getContactByEmail(
         hbUser.email
@@ -303,13 +362,7 @@ async function syncHivebriteToSalesforce(
         continue;
       }
 
-      const updatePayload = mapHivebriteToSalesforceContact(hbUser);
-
-      // TEMP TESTING: only sync ssmith@eidebailly.com
-      if (hbUser.email === "ssmith@eidebailly.com") {
-        console.log("______updatePayload", updatePayload);
-        console.log("______sfContact", sfContact);
-      }
+      const updatePayload = mapHivebriteToSalesforceContact(fullHbUser);
 
       // Skip if there is nothing to patch (all mapped fields are empty)
       if (Object.keys(updatePayload).length === 0) {
@@ -367,9 +420,12 @@ async function getSalesforceContactsHandler(
     schedule: POLL_SCHEDULE,
   });
 
+  // Compute the moving window once so both phases use an identical timestamp.
+  const updatedSince = new Date(Date.now() - REVERSE_SYNC_WINDOW_MS).toISOString();
+
   try {
-    await syncSalesforceToHivebrite(runLogger);
-    await syncHivebriteToSalesforce(runLogger);
+    await syncSalesforceToHivebrite(runLogger, updatedSince);
+    await syncHivebriteToSalesforce(runLogger, updatedSince);
 
     runLogger.info("getSalesforceContacts both sync phases complete");
   } catch (err: unknown) {

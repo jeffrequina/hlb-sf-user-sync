@@ -8,17 +8,6 @@
  * secrets management (Key Vault references) before going to production.
  */
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(
-      `Missing required environment variable: ${name}. ` +
-      `Check your local.settings.json (local) or Azure Application Settings (production).`
-    );
-  }
-  return value;
-}
-
 function optionalEnv(name: string, fallback = ""): string {
   return process.env[name] ?? fallback;
 }
@@ -57,8 +46,6 @@ export const config = {
     timeoutMs: parseInt(optionalEnv("HIVEBRITE_TIMEOUT_MS", "10000"), 10),
   },
   salesforce: {
-    webhookSecret: requireEnv("SF_WEBHOOK_SECRET"),
-
     // OAuth2 Client Credentials — hardcoded fallbacks for immediate deployment.
     // Override via Azure Application Settings / local.settings.json.
     oauthTokenUrl: optionalEnv(

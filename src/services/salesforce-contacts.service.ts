@@ -43,9 +43,28 @@ export class SalesforceContactsService {
   }
 
   /**
-   * Fetch all contacts (or a custom SOQL query) from Salesforce.
+   * Client whose baseURL is just the Salesforce instance root.
+   * Used for pagination — nextRecordsUrl is already an absolute path
+   * (e.g. /services/data/v60.0/query/01g...) so it must not be prefixed
+   * with the versioned path that buildClient() uses.
+   */
+  private buildRootClient(instanceUrl: string, accessToken: string): AxiosInstance {
+    return axios.create({
+      baseURL: instanceUrl,
+      timeout: config.salesforce.timeoutMs,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+      },
+    });
+  }
+
+  /**
+   * Fetch ALL contacts from Salesforce, following pagination automatically.
    *
-   * Always acquires a fresh OAuth token before the API call.
+   * Salesforce caps each query page at 2,000 records and sets done=false with
+   * a nextRecordsUrl when more pages exist. This method keeps fetching until
+   * done=true, then returns a single merged response containing every record.
    *
    * @param soqlQuery - Plain SOQL string (defaults to the contact sync query)
    * @param retry     - Internal flag: false on the retry attempt to avoid infinite loops
@@ -57,24 +76,57 @@ export class SalesforceContactsService {
     const { accessToken, instanceUrl } =
       await salesforceAuthService.getAccessToken();
 
-    const client = this.buildClient(instanceUrl, accessToken);
+    const client     = this.buildClient(instanceUrl, accessToken);
+    const rootClient = this.buildRootClient(instanceUrl, accessToken);
 
     try {
       logger.info("Querying Salesforce contacts", { soqlQuery });
 
-      const response = await client.get<
+      const firstPage = await client.get<
         SalesforceQueryResponse<SalesforceContactRecord>
-      >("/query", {
-        params: { q: soqlQuery },
+      >("/query", { params: { q: soqlQuery } });
+
+      const allRecords: SalesforceContactRecord[] = [...firstPage.data.records];
+      let done           = firstPage.data.done;
+      let nextRecordsUrl = firstPage.data.nextRecordsUrl;
+
+      logger.info("Salesforce contacts page 1 fetched", {
+        totalSize:   firstPage.data.totalSize,
+        pageRecords: firstPage.data.records.length,
+        done,
       });
 
-      logger.info("Salesforce contacts fetched", {
-        totalSize: response.data.totalSize,
-        returned: response.data.records.length,
-        done: response.data.done,
+      while (!done && nextRecordsUrl) {
+        logger.info("Fetching next page of Salesforce contacts", {
+          nextRecordsUrl,
+          fetchedSoFar: allRecords.length,
+        });
+
+        const page = await rootClient.get<
+          SalesforceQueryResponse<SalesforceContactRecord>
+        >(nextRecordsUrl);
+
+        allRecords.push(...page.data.records);
+        done           = page.data.done;
+        nextRecordsUrl = page.data.nextRecordsUrl;
+
+        logger.info("Salesforce contacts page fetched", {
+          pageRecords:  page.data.records.length,
+          totalFetched: allRecords.length,
+          done,
+        });
+      }
+
+      logger.info("Salesforce contacts fully fetched", {
+        totalSize:    firstPage.data.totalSize,
+        totalFetched: allRecords.length,
       });
 
-      return response.data;
+      return {
+        totalSize:    firstPage.data.totalSize,
+        done:         true,
+        records:      allRecords,
+      };
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
         if (err.response?.status === 401 && retry) {
@@ -101,6 +153,45 @@ export class SalesforceContactsService {
       throw err;
     }
   }
+  /**
+   * Fetch only Salesforce contacts modified on or after `updatedSince`.
+   *
+   * Appends a `WHERE LastModifiedDate >= {updatedSince}` clause to the
+   * default contact query, so only contacts changed within the current sync
+   * window are returned.  Used by Phase 1 (SF → HB) to mirror the time-window
+   * filtering that Phase 2 already applies when reading Hivebrite.
+   *
+   * @param updatedSince - ISO 8601 string, e.g. "2026-03-23T10:00:00.000Z"
+   */
+  async getRecentlyModifiedContacts(
+    updatedSince: string
+  ): Promise<SalesforceQueryResponse<SalesforceContactRecord>> {
+    const filteredQuery =
+      DEFAULT_CONTACT_QUERY +
+      ` WHERE LastModifiedDate >= ${updatedSince}` +
+      " ORDER BY LastModifiedDate ASC";
+    return this.getContacts(filteredQuery);
+  }
+
+  /**
+   * Fetch only Salesforce contacts whose CreatedDate falls on or after `createdSince`.
+   *
+   * Used by the createHivebriteUsers timer to limit the provisioning scan to
+   * contacts created within the current time window, avoiding a full-table scan
+   * on every run.
+   *
+   * @param createdSince - ISO 8601 string, e.g. "2026-04-01T09:00:00.000Z"
+   */
+  async getRecentlyCreatedContacts(
+    createdSince: string
+  ): Promise<SalesforceQueryResponse<SalesforceContactRecord>> {
+    const filteredQuery =
+      DEFAULT_CONTACT_QUERY +
+      ` WHERE CreatedDate >= ${createdSince}` +
+      " ORDER BY CreatedDate ASC";
+    return this.getContacts(filteredQuery);
+  }
+
   /**
    * Look up a single Salesforce Contact by email address.
    *

@@ -11,16 +11,69 @@ import { HivebriteError } from "../utils/errors";
 import logger from "../utils/logger";
 
 /**
+ * Token-bucket style rate limiter for the Hivebrite Admin API.
+ *
+ * Hivebrite enforces a hard limit of 300 requests per minute.
+ * This limiter caps outgoing calls at MAX_RPM (290) to leave a safety
+ * margin of 10 requests.  When the bucket is exhausted it calculates the
+ * remaining milliseconds in the current 60-second window and sleeps until
+ * the window resets before allowing further calls.
+ */
+class HivebriteRateLimiter {
+  private static readonly MAX_RPM = 280;
+  private count = 0;
+  private windowStart = Date.now();
+
+  async throttle(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.windowStart;
+
+    // Reset the window if a full minute has already passed.
+    if (elapsed >= 60_000) {
+      this.count = 0;
+      this.windowStart = now;
+    }
+
+    if (this.count >= HivebriteRateLimiter.MAX_RPM) {
+      // Sleep for the remainder of the current window plus a small buffer.
+      const waitMs = 60_000 - (Date.now() - this.windowStart) + 250;
+      logger.warn("Hivebrite rate limiter: bucket exhausted — waiting for next window", {
+        waitMs,
+        requestsInWindow: this.count,
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+      this.count = 0;
+      this.windowStart = Date.now();
+    }
+
+    this.count++;
+  }
+
+  /** Called when a 429 is received to hard-reset and wait out the minute. */
+  async backOffAfter429(): Promise<void> {
+    const waitMs = 60_000 - (Date.now() - this.windowStart) + 500;
+    logger.warn("Hivebrite 429 received — backing off until next window", { waitMs });
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.max(waitMs, 1_000)));
+    this.count = 0;
+    this.windowStart = Date.now();
+  }
+}
+
+/**
  * Hivebrite Admin API service.
  *
  * Authenticates via OAuth2 (password grant) using HivebriteAuthService.
  * The Bearer token is injected dynamically on each request via a request
  * interceptor, and automatically refreshed on 401 responses.
  *
+ * All outgoing requests are transparently rate-limited to 290 req/min via
+ * HivebriteRateLimiter to stay under Hivebrite's 300 req/min hard cap.
+ *
  * Docs: https://developer.hivebrite.com/reference
  */
 export class HivebriteService {
   private readonly client: AxiosInstance;
+  private readonly rateLimiter = new HivebriteRateLimiter();
   /** Tracks in-flight 401 retry to avoid infinite loops */
   private isRefreshing = false;
 
@@ -34,8 +87,11 @@ export class HivebriteService {
       },
     });
 
-    // ── Request interceptor: inject current Bearer token ──────────────────
+    // ── Request interceptor: rate-limit + inject current Bearer token ────
     this.client.interceptors.request.use(async (req) => {
+      // Throttle every outgoing request to stay under 290 req/min.
+      await this.rateLimiter.throttle();
+
       const token = await hivebriteAuthService.getAccessToken();
       req.headers["Authorization"] = `Bearer ${token}`;
       logger.debug("Hivebrite API request", {
@@ -45,7 +101,7 @@ export class HivebriteService {
       return req;
     });
 
-    // ── Response interceptor: log + handle 401 with one token refresh ─────
+    // ── Response interceptor: log + handle 401 refresh + 429 back-off ────
     this.client.interceptors.response.use(
       (res) => {
         logger.debug("Hivebrite API response", {
@@ -57,9 +113,23 @@ export class HivebriteService {
       async (err) => {
         const originalRequest = err.config;
 
+        if (!axios.isAxiosError(err)) {
+          return Promise.reject(err);
+        }
+
+        const status = err.response?.status;
+
+        // ── 429: rate limited — back off for the rest of the minute then retry once.
+        if (status === 429 && !originalRequest._retried429) {
+          originalRequest._retried429 = true;
+          await this.rateLimiter.backOffAfter429();
+          logger.warn("Hivebrite 429 — retrying after back-off", { url: originalRequest.url });
+          return this.client(originalRequest);
+        }
+
+        // ── 401: token expired — refresh once and retry.
         if (
-          axios.isAxiosError(err) &&
-          err.response?.status === 401 &&
+          status === 401 &&
           !this.isRefreshing &&
           !originalRequest._retry
         ) {
@@ -76,11 +146,21 @@ export class HivebriteService {
           }
         }
 
-        logger.error("Hivebrite API error", {
-          status: err.response?.status,
-          url: err.config?.url,
-          data: err.response?.data,
-        });
+        // 404s are expected "not found" signals on lookup endpoints (e.g.
+        // /users/find, /users/{id}).  Log at debug so individual callers can
+        // decide whether a missing record is an error or normal flow.
+        if (status === 404) {
+          logger.debug("Hivebrite resource not found", {
+            url: err.config?.url,
+            data: err.response?.data,
+          });
+        } else {
+          logger.error("Hivebrite API error", {
+            status,
+            url: err.config?.url,
+            data: err.response?.data,
+          });
+        }
         return Promise.reject(err);
       }
     );
@@ -142,7 +222,7 @@ export class HivebriteService {
   async getRecentlyUpdatedUsers(
     updatedSince: string
   ): Promise<HivebriteUserResponse[]> {
-    const perPage = 100;
+    const perPage = 100; // Hivebrite hard maximum is 100 per page
     const allUsers: HivebriteUserResponse[] = [];
     let page = 1;
 
@@ -165,8 +245,12 @@ export class HivebriteService {
           total_count,
         });
 
-        // Stop when we have retrieved all available records
-        if (allUsers.length >= total_count) break;
+        // Break when the page is not full — this is the last page.
+        // We cannot rely on `allUsers.length >= total_count` because Hivebrite
+        // returns the total count of ALL users in the system, not just the
+        // filtered (updated_since) subset. Requesting a page beyond what the
+        // filter produces results in 404 "expected :page in 1..N; got N+1".
+        if (users.length < perPage) break;
         page++;
       }
 
@@ -198,6 +282,36 @@ export class HivebriteService {
     }
   }
 
+  // ── Users: Get by ID ─────────────────────────────────────────────────────
+  /**
+   * Fetch the full profile of a single Hivebrite user by their numeric ID.
+   * GET /api/admin/v1/users/{id}
+   *
+   * The list endpoint (GET /users) only returns summary fields. Fields such as
+   * summary, linkedin_profile_url, and custom_attributes are only present on
+   * the single-user response — this method must be used before mapping a
+   * Hivebrite user back to Salesforce.
+   *
+   * Response is wrapped: { "user": { ... } }
+   */
+  async getUserById(hivebriteUserId: number): Promise<HivebriteUserResponse | null> {
+    try {
+      const response = await this.client.get<{ user: HivebriteUserResponse }>(
+        `/users/${hivebriteUserId}`
+      );
+      return response.data?.user ?? null;
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        return null;
+      }
+      throw new HivebriteError(
+        `Failed to fetch Hivebrite user by ID ${hivebriteUserId}: ${err instanceof Error ? err.message : String(err)}`,
+        502,
+        err
+      );
+    }
+  }
+
   // ── Users: Find ───────────────────────────────────────────────────────────
   /**
    * Look up a user by email address (list-search fallback).
@@ -226,19 +340,36 @@ export class HivebriteService {
    *   field=email
    *   value=<email address>
    *
+   * The endpoint wraps the result in a `user` key:
+   *   { "user": { "id": 123, "email": "...", ... } }
+   *
    * Returns the matched user or null (404 / no match).
    */
-  async findUserByEmailPost(email: string): Promise<HivebriteUserResponse | null> {
+  async findUserByEmailPost(email: string): Promise<HivebriteUserResponse | null | undefined> {
     const formData = new FormData();
     formData.append("field", "email");
     formData.append("value", email);
 
     try {
-      const response = await this.client.post<HivebriteUserResponse>(
+      const response = await this.client.post<{ user: HivebriteUserResponse }>(
         "/users/find",
         formData
       );
-      return response.data ?? null;
+
+      // logger.info("_______Hivebrite USER BY EMAIL", {
+      //   response: JSON.stringify(response.data?.user?.updated_at ?? "no updated_at"),
+      //   updated_at: response.data?.user?.updated_at,
+      //   time_now: new Date(Date.now()).toISOString(),
+      //   time_diff: new Date(new Date(Date.now()).getTime() - new Date(response.data?.user?.updated_at ?? "").getTime()).toISOString(),
+      // });
+
+      // Skip users not updated within the last 15 minutes
+      if (response.data?.user?.updated_at && Date.now() - new Date(response.data.user.updated_at).getTime() < 15 * 60 * 1000) {
+        // logger.info("_______Hivebrite USER JUST RECENTLY UPDATED... SKIPPING");
+        return undefined;
+      }
+        
+      return response.data?.user ?? null;
     } catch (err: unknown) {
       if (axios.isAxiosError(err) && err.response?.status === 404) {
         return null;
@@ -255,15 +386,22 @@ export class HivebriteService {
   /**
    * Create a new Hivebrite user.
    * POST /api/admin/v1/users
+   *
+   * Hivebrite expects the body wrapped: { "user": { ... } }
+   * and responds with the same wrapper: { "user": { "id": ..., ... } }
    */
   async createUser(payload: HivebriteCreateUser): Promise<HivebriteUserResponse> {
     try {
-      const response = await this.client.post<HivebriteUserResponse>("/users", payload);
+      const response = await this.client.post<{ user: HivebriteUserResponse }>(
+        "/users",
+        { user: payload }
+      );
+      const user = response.data.user;
       logger.info("Hivebrite user created", {
         email: payload.email,
-        hivebriteId: response.data.id,
+        hivebriteId: user.id,
       });
-      return response.data;
+      return user;
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
         throw new HivebriteError(
@@ -280,21 +418,25 @@ export class HivebriteService {
   /**
    * Update an existing Hivebrite user by their numeric ID.
    * PUT /api/admin/v1/users/{id}
+   *
+   * Hivebrite expects the body wrapped: { "user": { ... } }
+   * and responds with the same wrapper: { "user": { "id": ..., ... } }
    */
   async updateUser(
     hivebriteUserId: number,
     payload: HivebriteUpdateUser
   ): Promise<HivebriteUserResponse> {
     try {
-      const response = await this.client.put<HivebriteUserResponse>(
+      const response = await this.client.put<{ user: HivebriteUserResponse }>(
         `/users/${hivebriteUserId}`,
-        payload
+        { user: payload }
       );
+      const user = response.data.user;
       logger.info("Hivebrite user updated", {
         email: payload.email,
         hivebriteId: hivebriteUserId,
       });
-      return response.data;
+      return user;
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
         throw new HivebriteError(

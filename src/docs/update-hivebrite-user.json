@@ -55,14 +55,6 @@
   "facebook_profile_url": "string",
   "instagram_profile_url": "string",
   "honorary_title": "mr",
-  "live_location": {
-    "address": "string",
-    "lat": 0,
-    "lng": 0,
-    "city": "string",
-    "country": "string",
-    "country_code": "string"
-  },
   "resume": "string",
   "locale": "en",
   "skills": [
@@ -70,5 +62,5 @@
       "id": 0,
       "name": "string"
     }
-  ],
+  ]
 }
